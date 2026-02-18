@@ -1,6 +1,10 @@
 """
 Evaluate a fine-tuned Whisper model on the test split.
 Reports Word Error Rate (WER).
+
+Supports both full fine-tuned models and LoRA/QLoRA adapter models.
+If the model path contains `adapter_config.json`, it will automatically
+load the adapter weights on top of the base model.
 """
 
 import os
@@ -17,6 +21,37 @@ from src.train import load_config, load_dataset_from_dir
 console = Console()
 
 
+def _load_model_auto(model_path: str, cfg: dict | None = None):
+    """
+    Load a Whisper model from *model_path*.
+
+    If *model_path* contains ``adapter_config.json`` (i.e. a PEFT adapter
+    checkpoint), the base model is loaded first and the adapter is applied.
+    Otherwise the path is treated as a regular HuggingFace model directory.
+    """
+    adapter_cfg = os.path.join(model_path, "adapter_config.json")
+
+    if os.path.isfile(adapter_cfg):
+        # LoRA / QLoRA adapter checkpoint
+        from peft import PeftModel
+        import json
+
+        with open(adapter_cfg, "r") as f:
+            acfg = json.load(f)
+        base_name = acfg.get("base_model_name_or_path", "openai/whisper-tiny")
+        console.print(f"Loading base model: [bold]{base_name}[/bold]")
+        base_model = WhisperForConditionalGeneration.from_pretrained(base_name)
+        console.print(f"Applying adapter from: [bold]{model_path}[/bold]")
+        model = PeftModel.from_pretrained(base_model, model_path)
+        model = model.merge_and_unload()  # merge for fast inference
+        processor = WhisperProcessor.from_pretrained(model_path)
+    else:
+        processor = WhisperProcessor.from_pretrained(model_path)
+        model = WhisperForConditionalGeneration.from_pretrained(model_path)
+
+    return processor, model
+
+
 def run_evaluation(config_path: str, model_path: str | None = None) -> dict:
     """
     Evaluate a Whisper model on the test split defined in config.
@@ -30,19 +65,22 @@ def run_evaluation(config_path: str, model_path: str | None = None) -> dict:
     """
     cfg = load_config(config_path)
 
-    # Resolve model path
+    # Resolve model path — prefer merged copy, then adapter, then base
     if model_path is None:
-        model_path = os.path.join(cfg["training"]["output_dir"], "final")
-        if not os.path.exists(model_path):
-            # Fallback to base model
+        merged_path = os.path.join(cfg["training"]["output_dir"], "merged")
+        final_path = os.path.join(cfg["training"]["output_dir"], "final")
+        if os.path.exists(merged_path):
+            model_path = merged_path
+        elif os.path.exists(final_path):
+            model_path = final_path
+        else:
             model_path = cfg["model"]["name"]
             console.print(
                 f"[yellow]No fine-tuned model found. Evaluating base model: {model_path}[/yellow]"
             )
 
     console.print(f"Loading model from: [bold]{model_path}[/bold]")
-    processor = WhisperProcessor.from_pretrained(model_path)
-    model = WhisperForConditionalGeneration.from_pretrained(model_path)
+    processor, model = _load_model_auto(model_path, cfg)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
     model.eval()

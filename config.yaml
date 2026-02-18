@@ -13,6 +13,41 @@ data:
   max_duration_seconds: 30             # Max audio clip length
   test_split: 0.2                      # Fraction of data used for evaluation
 
+# ---------------------------------------------------------------------------
+# Fine-tuning strategy
+# ---------------------------------------------------------------------------
+# strategy:  full | lora | qlora
+#   full  = update all model parameters (default, highest quality, most VRAM)
+#   lora  = low-rank adapters via PEFT – trains ~0.6% of parameters
+#   qlora = 4-bit quantised base + LoRA adapters – lowest VRAM
+#
+# freeze_encoder: true|false
+#   Freeze the audio encoder and only train the decoder.
+#   Reduces trainable params by ~50%, prevents catastrophic forgetting of
+#   acoustic features. Recommended when your audio domain is similar to the
+#   pre-training data (e.g. clean English speech).
+#
+# gradient_checkpointing: true|false
+#   Trade compute for VRAM – recomputes activations during backward pass
+#   instead of storing them. Cuts memory ~40% at the cost of ~20% slower
+#   training. Helpful when VRAM is tight.
+
+finetuning:
+  strategy: "lora"                     # full | lora | qlora
+  freeze_encoder: true                 # Freeze encoder weights
+  gradient_checkpointing: true         # Reduce VRAM usage
+
+  # LoRA / QLoRA hyper-parameters (ignored when strategy = full)
+  lora:
+    r: 16                              # Rank of the low-rank matrices
+    lora_alpha: 32                     # Scaling factor (alpha / r)
+    lora_dropout: 0.05                 # Dropout on adapter weights
+    target_modules:                    # Which linear layers to adapt
+      - "q_proj"
+      - "v_proj"
+    bias: "none"                       # none | all | lora_only
+    task_type: "SEQ_2_SEQ_LM"         # Whisper is an encoder-decoder model
+
 training:
   output_dir: "output/whisper-tiny-finetuned"
   num_train_epochs: 3

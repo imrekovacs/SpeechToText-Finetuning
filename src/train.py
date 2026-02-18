@@ -1,6 +1,17 @@
 """
 Fine-tune OpenAI Whisper Tiny on a custom dataset.
 
+Supported fine-tuning strategies
+--------------------------------
+- **full**   – update every model parameter (highest quality, most VRAM)
+- **lora**   – low-rank adapters via PEFT (~0.6 % trainable params)
+- **qlora**  – 4-bit quantised base model + LoRA (lowest VRAM)
+
+Additional techniques
+---------------------
+- **freeze_encoder** – freeze the audio encoder, train only the decoder
+- **gradient_checkpointing** – trade compute for VRAM savings (~40 %)
+
 Dataset layout expected in `data/`:
   data/
     audio1.wav
@@ -30,6 +41,7 @@ from transformers import (
     WhisperTokenizer,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
+    BitsAndBytesConfig,
 )
 import evaluate
 
@@ -187,6 +199,92 @@ def make_compute_metrics(processor):
 # Training entrypoint
 # ---------------------------------------------------------------------------
 
+def _count_parameters(model) -> tuple[int, int]:
+    """Return (trainable, total) parameter counts."""
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    return trainable, total
+
+
+def _apply_finetuning_strategy(model, cfg: dict):
+    """
+    Apply the selected fine-tuning strategy to *model* **in-place** and
+    return the (possibly wrapped) model.
+
+    Strategies
+    ----------
+    full  – no changes, all parameters remain trainable.
+    lora  – attach LoRA adapters via PEFT.
+    qlora – model must already be loaded in 4-bit; attach LoRA adapters.
+    """
+    ft = cfg.get("finetuning", {})
+    strategy = ft.get("strategy", "full").lower()
+
+    # ── Freeze encoder ────────────────────────────────────────────────
+    if ft.get("freeze_encoder", False):
+        for param in model.model.encoder.parameters():
+            param.requires_grad = False
+        print("Encoder frozen — only decoder parameters will be trained.")
+
+    # ── Gradient checkpointing ────────────────────────────────────────
+    if ft.get("gradient_checkpointing", False):
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        print("Gradient checkpointing enabled.")
+
+    # ── LoRA / QLoRA ──────────────────────────────────────────────────
+    if strategy in ("lora", "qlora"):
+        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
+
+        lora_cfg = ft.get("lora", {})
+        r = lora_cfg.get("r", 16)
+        alpha = lora_cfg.get("lora_alpha", 32)
+        dropout = lora_cfg.get("lora_dropout", 0.05)
+        target = lora_cfg.get("target_modules", ["q_proj", "v_proj"])
+        bias = lora_cfg.get("bias", "none")
+
+        # Map string task type to PEFT enum
+        task_str = lora_cfg.get("task_type", "SEQ_2_SEQ_LM")
+        task_type = getattr(TaskType, task_str, TaskType.SEQ_2_SEQ_LM)
+
+        if strategy == "qlora":
+            # prepare 4-bit quantised model for training
+            model = prepare_model_for_kbit_training(model)
+
+        peft_config = LoraConfig(
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            target_modules=target,
+            bias=bias,
+            task_type=task_type,
+        )
+
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
+    else:
+        trainable, total = _count_parameters(model)
+        pct = trainable / total * 100 if total else 0
+        print(f"Strategy: full — trainable params: {trainable:,} / {total:,} ({pct:.1f}%)")
+
+    return model
+
+
+def _get_quantization_config(cfg: dict):
+    """Return a BitsAndBytesConfig for QLoRA, or None."""
+    ft = cfg.get("finetuning", {})
+    strategy = ft.get("strategy", "full").lower()
+    if strategy != "qlora":
+        return None
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+    )
+
+
 def run_training(config_path: str):
     cfg = load_config(config_path)
 
@@ -194,17 +292,34 @@ def run_training(config_path: str):
     language = cfg["model"].get("language", "en")
     task = cfg["model"].get("task", "transcribe")
     tcfg = cfg["training"]
+    ft = cfg.get("finetuning", {})
+    strategy = ft.get("strategy", "full").lower()
 
     print(f"Loading model: {model_name}")
+    print(f"Fine-tuning strategy: {strategy}")
+
     processor = WhisperProcessor.from_pretrained(
         model_name, language=language, task=task
     )
-    model = WhisperForConditionalGeneration.from_pretrained(model_name)
+
+    # Load model — optionally quantised for QLoRA
+    quant_config = _get_quantization_config(cfg)
+    load_kwargs: dict[str, Any] = {}
+    if quant_config is not None:
+        load_kwargs["quantization_config"] = quant_config
+        load_kwargs["device_map"] = "auto"
+
+    model = WhisperForConditionalGeneration.from_pretrained(
+        model_name, **load_kwargs
+    )
 
     # Force decoder settings
     model.generation_config.language = language
     model.generation_config.task = task
     model.generation_config.forced_decoder_ids = None
+
+    # Apply fine-tuning strategy (LoRA, freezing, grad ckpt)
+    model = _apply_finetuning_strategy(model, cfg)
 
     print("Loading dataset...")
     dataset = load_dataset_from_dir(cfg)
@@ -217,6 +332,12 @@ def run_training(config_path: str):
         decoder_start_token_id=model.config.decoder_start_token_id,
     )
 
+    # Adjust learning rate for LoRA (higher works better with adapters)
+    lr = float(tcfg.get("learning_rate", 1e-5))
+    if strategy in ("lora", "qlora") and lr <= 1e-5:
+        lr = 1e-3  # LoRA benefits from a higher lr
+        print(f"  Auto-raised learning rate to {lr} for {strategy.upper()}.")
+
     # Training arguments
     training_args = Seq2SeqTrainingArguments(
         output_dir=tcfg["output_dir"],
@@ -224,7 +345,7 @@ def run_training(config_path: str):
         per_device_train_batch_size=tcfg.get("per_device_train_batch_size", 4),
         per_device_eval_batch_size=tcfg.get("per_device_eval_batch_size", 4),
         gradient_accumulation_steps=tcfg.get("gradient_accumulation_steps", 2),
-        learning_rate=float(tcfg.get("learning_rate", 1e-5)),
+        learning_rate=lr,
         warmup_steps=tcfg.get("warmup_steps", 50),
         logging_steps=tcfg.get("logging_steps", 10),
         eval_steps=tcfg.get("eval_steps", 50),
@@ -259,6 +380,21 @@ def run_training(config_path: str):
 
     # Save final model + processor
     final_dir = os.path.join(tcfg["output_dir"], "final")
-    model.save_pretrained(final_dir)
-    processor.save_pretrained(final_dir)
-    print(f"Model saved to {final_dir}")
+
+    if strategy in ("lora", "qlora"):
+        # Save only the adapter weights (very small, ~2-5 MB)
+        model.save_pretrained(final_dir)
+        processor.save_pretrained(final_dir)
+        print(f"Adapter weights saved to {final_dir}")
+
+        # Also save a merged copy for easy inference
+        merged_dir = os.path.join(tcfg["output_dir"], "merged")
+        print("Merging adapter weights into base model...")
+        merged_model = model.merge_and_unload()
+        merged_model.save_pretrained(merged_dir)
+        processor.save_pretrained(merged_dir)
+        print(f"Merged model saved to {merged_dir}")
+    else:
+        model.save_pretrained(final_dir)
+        processor.save_pretrained(final_dir)
+        print(f"Model saved to {final_dir}")

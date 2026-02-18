@@ -38,9 +38,44 @@ def transcribe(
 @app.command()
 def train(
     config_path: str = typer.Argument("config.yaml", help="Path to training config YAML"),
+    strategy: str = typer.Option(
+        None,
+        "--strategy", "-s",
+        help="Override fine-tuning strategy: full, lora, qlora",
+    ),
+    freeze_encoder: bool = typer.Option(
+        None,
+        "--freeze-encoder/--no-freeze-encoder",
+        help="Override encoder freezing setting from config",
+    ),
+    gradient_checkpointing: bool = typer.Option(
+        None,
+        "--grad-ckpt/--no-grad-ckpt",
+        help="Override gradient checkpointing setting from config",
+    ),
 ):
     """Fine-tune Whisper Tiny on the dataset specified in the config."""
-    from src.train import run_training
+    from src.train import run_training, load_config
+    import yaml
+
+    # Apply CLI overrides to the config before training
+    if strategy or freeze_encoder is not None or gradient_checkpointing is not None:
+        cfg = load_config(config_path)
+        ft = cfg.setdefault("finetuning", {})
+        if strategy:
+            ft["strategy"] = strategy
+        if freeze_encoder is not None:
+            ft["freeze_encoder"] = freeze_encoder
+        if gradient_checkpointing is not None:
+            ft["gradient_checkpointing"] = gradient_checkpointing
+        # Write patched config to a temp file
+        import tempfile, os
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False, encoding="utf-8"
+        )
+        yaml.dump(cfg, tmp, default_flow_style=False)
+        tmp.close()
+        config_path = tmp.name
 
     console.print(f"[bold blue]Starting training with config:[/bold blue] {config_path}")
     run_training(config_path)

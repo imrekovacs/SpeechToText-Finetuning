@@ -32,8 +32,11 @@ pandas>=2.0.0
 # Config management
 pyyaml>=6.0.1
 
-# Optional: faster training / memory
-bitsandbytes>=0.43.0 ; platform_system != "Windows"
+# PEFT (LoRA / QLoRA adapters)
+peft>=0.13.0
+
+# Quantisation (QLoRA 4-bit) — works on all platforms since v0.44
+bitsandbytes>=0.43.0
 
 # Dev (optional)
 pytest>=8.0.0

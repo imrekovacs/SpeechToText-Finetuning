@@ -32,15 +32,39 @@ _model_cache: dict = {}
 
 
 def load_model(model_path: str, device: str | None = None):
-    """Load and cache a Whisper model + processor."""
+    """
+    Load and cache a Whisper model + processor.
+
+    Automatically detects LoRA/QLoRA adapter checkpoints (presence of
+    ``adapter_config.json``) and merges adapter weights into the base model
+    for efficient inference.
+    """
     if model_path in _model_cache:
         return _model_cache[model_path]
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Loading model: {model_path} → {device}")
 
-    processor = WhisperProcessor.from_pretrained(model_path)
-    model = WhisperForConditionalGeneration.from_pretrained(model_path)
+    adapter_cfg_path = os.path.join(model_path, "adapter_config.json")
+
+    if os.path.isfile(adapter_cfg_path):
+        # ── LoRA / QLoRA adapter checkpoint ──
+        import json
+        from peft import PeftModel
+
+        with open(adapter_cfg_path, "r") as f:
+            acfg = json.load(f)
+        base_name = acfg.get("base_model_name_or_path", "openai/whisper-tiny")
+        print(f"Loading base model: {base_name}")
+        base_model = WhisperForConditionalGeneration.from_pretrained(base_name)
+        print(f"Applying adapter: {model_path}")
+        model = PeftModel.from_pretrained(base_model, model_path)
+        model = model.merge_and_unload()
+        processor = WhisperProcessor.from_pretrained(model_path)
+    else:
+        print(f"Loading model: {model_path} → {device}")
+        processor = WhisperProcessor.from_pretrained(model_path)
+        model = WhisperForConditionalGeneration.from_pretrained(model_path)
+
     model.to(device).eval()
 
     _model_cache[model_path] = (processor, model, device)

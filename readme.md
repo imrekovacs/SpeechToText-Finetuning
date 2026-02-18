@@ -30,13 +30,20 @@ Fine-tuning is useful when you need Whisper to perform better on:
 ```
 ┌─────────────────────────────────────────────────────┐
 │                    CLI (cli.py)                      │
-│         transcribe | train | evaluate               │
+│    transcribe | train [--strategy] | evaluate       │
 └──────────┬──────────────┬──────────────┬────────────┘
            │              │              │
      ┌─────▼─────┐  ┌────▼─────┐  ┌─────▼──────┐
      │transcribe  │  │  train   │  │  evaluate   │
      │   .py      │  │   .py    │  │    .py      │
      └─────┬──────┘  └────┬─────┘  └─────┬───────┘
+           │              │              │
+           │         ┌────▼──────────┐   │
+           │         │  PEFT (LoRA)  │   │
+           │         │  + Quantize   │   │
+           │         │  + Freeze     │   │
+           │         │  + Grad Ckpt  │   │
+           │         └────┬──────────┘   │
            │              │              │
      ┌─────▼──────────────▼──────────────▼────────┐
      │        HuggingFace Transformers            │
@@ -145,6 +152,8 @@ uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu1
 uv pip install -r requirements.txt --extra-index-url https://pypi.org/simple/ --index-url https://download.pytorch.org/whl/cu124
 ```
 
+This installs all dependencies including `peft` (for LoRA/QLoRA) and `bitsandbytes` (for 4-bit quantization).
+
 ### Step 5: Prepare Sample Data (Optional)
 
 To quickly test with a small LibriSpeech dataset (10 samples):
@@ -224,6 +233,119 @@ The standalone `inference.py` provides additional features:
 
 ---
 
+## Fine-Tuning Techniques
+
+This project supports multiple fine-tuning strategies that let you trade off between quality, speed, and VRAM usage. Configure them in `config.yaml` under the `finetuning:` section, or override via CLI flags.
+
+### Strategy Comparison
+
+| Strategy | Trainable Params | VRAM Usage | Training Speed | When to Use |
+|----------|-----------------|------------|----------------|-------------|
+| **full** | 100% (~39M) | ~3-4 GB | Baseline | Best quality, enough VRAM |
+| **lora** | ~0.6% (~230K) | ~1.5-2 GB | 2-3× faster | Limited VRAM, avoid overfitting |
+| **qlora** | ~0.6% (~230K) | ~1-1.5 GB | Similar to LoRA | Very limited VRAM (4 GB cards) |
+
+### LoRA (Low-Rank Adaptation)
+
+Instead of updating all 39M parameters, LoRA injects small trainable matrices (rank `r`) into the attention layers (`q_proj`, `v_proj`). The base model weights stay frozen.
+
+**Advantages:**
+- Trains ~0.6% of parameters → much faster, less VRAM
+- Adapter weights are tiny (~2-5 MB vs 150 MB for full model)
+- Less prone to catastrophic forgetting on small datasets
+- Multiple adapters can be swapped without reloading the base model
+
+**Config:**
+```yaml
+finetuning:
+  strategy: "lora"
+  lora:
+    r: 16              # Rank — higher = more capacity, more params
+    lora_alpha: 32     # Scaling factor (typically 2× rank)
+    lora_dropout: 0.05 # Regularization
+    target_modules:    # Which layers to adapt
+      - "q_proj"
+      - "v_proj"
+```
+
+### QLoRA (Quantized LoRA)
+
+QLoRA loads the base model in **4-bit precision** (NF4 quantization) and trains LoRA adapters on top. This cuts VRAM usage by ~50% compared to full precision.
+
+**Config:**
+```yaml
+finetuning:
+  strategy: "qlora"
+  # Same lora: section as above
+```
+
+> **Note:** QLoRA requires `bitsandbytes`. The first run may take longer due to quantization overhead.
+
+### Encoder Freezing
+
+Whisper's encoder converts audio spectrograms to embeddings. If your audio domain is similar to the pre-training data (clean English speech), the encoder features are already excellent — freezing it prevents catastrophic forgetting and halves trainable parameters.
+
+**Config:**
+```yaml
+finetuning:
+  freeze_encoder: true
+```
+
+**When to freeze:**
+- Clean English speech (encoder already optimised)
+- Small datasets (< 1000 samples) where overfitting is a risk
+- When combining with LoRA for maximum efficiency
+
+**When NOT to freeze:**
+- Very different audio domain (e.g. noisy factory environments)
+- New language the model hasn't seen
+- Large dataset (> 10,000 samples) where you want maximum adaptation
+
+### Gradient Checkpointing
+
+Normally, all intermediate activations are stored in VRAM for the backward pass. Gradient checkpointing discards them and recomputes on-the-fly, cutting VRAM ~40% at the cost of ~20% slower training.
+
+**Config:**
+```yaml
+finetuning:
+  gradient_checkpointing: true
+```
+
+### CLI Overrides
+
+You can override any fine-tuning setting from the command line without editing `config.yaml`:
+
+```bash
+# Train with LoRA strategy
+.venv\Scripts\python.exe cli.py train config.yaml --strategy lora
+
+# Train with full strategy, frozen encoder, gradient checkpointing
+.venv\Scripts\python.exe cli.py train config.yaml --strategy full --freeze-encoder --grad-ckpt
+
+# Train with QLoRA
+.venv\Scripts\python.exe cli.py train config.yaml --strategy qlora
+```
+
+### Combining Techniques
+
+The techniques are composable. A recommended setup for consumer GPUs:
+
+```yaml
+finetuning:
+  strategy: "lora"
+  freeze_encoder: true
+  gradient_checkpointing: true
+  lora:
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    target_modules: ["q_proj", "v_proj"]
+```
+
+This combination trains only ~230K parameters (LoRA adapters on the decoder's attention layers), uses gradient checkpointing to reduce VRAM, and freezes the encoder — ideal for an RTX 2080 or similar 8 GB card.
+
+---
+
 ## Configuration
 
 All training parameters are in `config.yaml`:
@@ -234,8 +356,15 @@ All training parameters are in `config.yaml`:
 | `model.language` | `en` | Target language |
 | `data.train_dir` | `data` | Folder with audio + metadata |
 | `data.test_split` | `0.2` | Fraction reserved for evaluation |
+| `finetuning.strategy` | `lora` | `full`, `lora`, or `qlora` |
+| `finetuning.freeze_encoder` | `true` | Freeze the audio encoder |
+| `finetuning.gradient_checkpointing` | `true` | Enable gradient checkpointing |
+| `finetuning.lora.r` | `16` | LoRA rank (higher = more capacity) |
+| `finetuning.lora.lora_alpha` | `32` | LoRA scaling factor |
+| `finetuning.lora.lora_dropout` | `0.05` | Dropout on adapter weights |
+| `finetuning.lora.target_modules` | `["q_proj","v_proj"]` | Layers to attach adapters to |
 | `training.num_train_epochs` | `3` | Number of training passes |
-| `training.learning_rate` | `1e-5` | Learning rate |
+| `training.learning_rate` | `1e-5` | Learning rate (auto-raised to 1e-3 for LoRA) |
 | `training.fp16` | `true` | Mixed precision (faster, less VRAM) |
 | `training.per_device_train_batch_size` | `4` | Batch size per GPU |
 
