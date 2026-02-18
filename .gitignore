@@ -4,6 +4,9 @@ output/
 # Virtual environment
 .venv/
 
+# Agents
+.github
+
 # Python
 __pycache__/
 *.py[cod]
