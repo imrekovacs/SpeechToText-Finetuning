@@ -1,0 +1,34 @@
+# Whisper Tiny Fine-tuning Configuration
+# ========================================
+
+model:
+  name: "openai/whisper-tiny"
+  language: "en"
+  task: "transcribe"
+
+data:
+  train_dir: "data"                    # Directory containing audio + transcripts
+  audio_format: "wav"                  # Audio file format (wav, mp3, flac)
+  sample_rate: 16000                   # Whisper expects 16kHz
+  max_duration_seconds: 30             # Max audio clip length
+  test_split: 0.2                      # Fraction of data used for evaluation
+
+training:
+  output_dir: "output/whisper-tiny-finetuned"
+  num_train_epochs: 3
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 2
+  learning_rate: 1.0e-5
+  warmup_steps: 50
+  logging_steps: 10
+  eval_steps: 50
+  save_steps: 100
+  save_total_limit: 2
+  fp16: true                           # Use mixed precision (requires CUDA)
+  dataloader_num_workers: 0            # Set to 0 on Windows
+  push_to_hub: false
+  report_to: "none"
+
+evaluation:
+  metric: "wer"                        # Word Error Rate

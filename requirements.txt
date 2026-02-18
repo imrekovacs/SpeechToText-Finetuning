@@ -1,0 +1,39 @@
+# Core ML
+torch>=2.1.0
+torchaudio>=2.1.0
+
+# Whisper model (HuggingFace version for finetuning)
+transformers>=4.41.0
+datasets>=2.18.0
+accelerate>=0.30.0
+evaluate>=0.4.1
+
+# Tokenizer / utils
+tokenizers>=0.15.2
+huggingface-hub>=0.23.0
+
+# Audio processing
+librosa>=0.10.1
+soundfile>=0.12.1
+numpy>=1.24.0
+scipy>=1.11.0
+
+# CLI framework
+typer>=0.12.3
+rich>=13.7.0
+
+# Training utilities
+tqdm>=4.66.0
+
+# Optional but recommended
+jiwer>=3.0.3      # WER evaluation
+pandas>=2.0.0
+
+# Config management
+pyyaml>=6.0.1
+
+# Optional: faster training / memory
+bitsandbytes>=0.43.0 ; platform_system != "Windows"
+
+# Dev (optional)
+pytest>=8.0.0
